@@ -1,0 +1,31 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  --bg-main: #f6efe8;
+  --bg-accent: #d6e3f3;
+  --ink: #1f2430;
+  --moss: #4d6a5a;
+  --coral: #f36b5d;
+}
+
+@layer base {
+  body {
+    font-family: "Alegreya Sans", "Trebuchet MS", sans-serif;
+    color: var(--ink);
+    background-color: var(--bg-main);
+    background-image: radial-gradient(circle at 10% 20%, rgba(243, 107, 93, 0.15), transparent 45%),
+      radial-gradient(circle at 85% 10%, rgba(77, 106, 90, 0.18), transparent 40%),
+      linear-gradient(135deg, rgba(214, 227, 243, 0.5), rgba(246, 239, 232, 0.2));
+    min-height: 100vh;
+  }
+
+  h1,
+  h2,
+  h3 {
+    font-family: "Playfair Display", "Georgia", serif;
+    letter-spacing: 0.02em;
+  }
+}
