@@ -1,4 +1,4 @@
-// File: C:\Users\alvar\OneDrive\Escritorio\SPIDER-DEV\create_email\src\app\page.tsx
+// File: D:\SPIDER-DEV\UAI\email_generator\src\app\page.tsx
 import * as entry from '../../../src/app/page.js'
 import type { ResolvingMetadata, ResolvingViewport } from 'next/dist/lib/metadata/types/metadata-interface.js'
 

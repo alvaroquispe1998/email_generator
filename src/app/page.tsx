@@ -89,6 +89,24 @@ function normalizeEmail(value: string): string {
   return `${local}@${domain}`;
 }
 
+function buildCorrelativeEmail(baseEmail: string, usedEmails: Set<string>): string {
+  const normalized = normalizeEmail(baseEmail);
+  if (!normalized) {
+    return "";
+  }
+  const [local, domain] = normalized.split("@");
+  if (!local || !domain) {
+    return "";
+  }
+  for (let index = 2; index < 1000; index += 1) {
+    const candidate = `${local}${index}@${domain}`;
+    if (!usedEmails.has(candidate)) {
+      return candidate;
+    }
+  }
+  return "";
+}
+
 function findColumn(columns: string[], candidates: string[]): string {
   const normalizedCandidates = candidates.map(normalizeKey);
   const found = columns.find((column) => {
@@ -321,6 +339,9 @@ export default function HomePage() {
   const [hasUserMapping, setHasUserMapping] = useState(false);
   const [outlookDirectory, setOutlookDirectory] = useState<OutlookDirectory | null>(null);
   const [emailOverrides, setEmailOverrides] = useState<Record<string, string>>({});
+  const [pendingBulkAction, setPendingBulkAction] = useState<
+    null | "secondName" | "correlative"
+  >(null);
 
   useEffect(() => {
     const rawMapping = localStorage.getItem(STORAGE_MAPPING);
@@ -423,11 +444,8 @@ export default function HomePage() {
     }
     return baseExportRows
       .map((row) => {
-        const key = String(row.__rowNumber);
-        const override = emailOverrides[key];
         const generatedEmail = normalizeEmail(getGeneratedEmail(row, mapping));
-        const effectiveEmail = normalizeEmail(override || generatedEmail);
-        if (!effectiveEmail || !existingEmails.has(effectiveEmail)) {
+        if (!generatedEmail || !existingEmails.has(generatedEmail)) {
           return null;
         }
         const { nombre, apellido } = getRowNameParts(row, mapping);
@@ -439,7 +457,7 @@ export default function HomePage() {
         };
       })
       .filter(Boolean) as EmailConflictRow[];
-  }, [baseExportRows, mapping, emailOverrides, existingEmails]);
+  }, [baseExportRows, mapping, existingEmails]);
   const plannedEmailCounts = useMemo(() => {
     const counts = new Map<string, number>();
     baseExportRows.forEach((row) => {
@@ -464,6 +482,55 @@ export default function HomePage() {
       ),
     [baseExportRows, mapping, emailOverrides, existingEmails, plannedEmailCounts]
   );
+
+  const buildUsedEmailSet = (overrides: Record<string, string>) => {
+    const used = new Set<string>();
+    existingEmails.forEach((email) => used.add(email));
+    baseExportRows.forEach((row) => {
+      const key = String(row.__rowNumber);
+      const override = overrides[key];
+      const email = normalizeEmail(override || getGeneratedEmail(row, mapping));
+      if (email) {
+        used.add(email);
+      }
+    });
+    return used;
+  };
+
+  const applySecondNameOverrides = () => {
+    setEmailOverrides(() => {
+      const updated: Record<string, string> = {};
+      emailConflictRows.forEach((conflict) => {
+        const key = String(conflict.rowNumber);
+        const alternate = getAlternateEmail(conflict.nombre, conflict.apellido);
+        if (!alternate) {
+          return;
+        }
+        if (normalizeEmail(alternate) === conflict.generatedEmail) {
+          return;
+        }
+        updated[key] = alternate;
+      });
+      return updated;
+    });
+  };
+
+  const applyCorrelativeOverrides = () => {
+    setEmailOverrides(() => {
+      const updated: Record<string, string> = {};
+      const used = buildUsedEmailSet(updated);
+      emailConflictRows.forEach((conflict) => {
+        const key = String(conflict.rowNumber);
+        const candidate = buildCorrelativeEmail(conflict.generatedEmail, used);
+        if (!candidate) {
+          return;
+        }
+        updated[key] = candidate;
+        used.add(normalizeEmail(candidate));
+      });
+      return updated;
+    });
+  };
 
   const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -547,8 +614,8 @@ export default function HomePage() {
     }
   };
 
-  const handleGenerate = () => {
-    const outputRows = buildOutputRows(exportRows, mapping).map((row, index) => {
+  const buildCurrentOutputRows = () =>
+    buildOutputRows(exportRows, mapping).map((row, index) => {
       const sourceRow = exportRows[index];
       const key = String(sourceRow.__rowNumber);
       const override = emailOverrides[key];
@@ -557,6 +624,9 @@ export default function HomePage() {
       }
       return row;
     });
+
+  const handleGenerate = () => {
+    const outputRows = buildCurrentOutputRows();
     setGeneratedRows(outputRows);
     setCsvPreview(outputRows.slice(0, 20));
     const csvBody = Papa.unparse(
@@ -573,15 +643,16 @@ export default function HomePage() {
   };
 
   const handleDownload = () => {
-    if (!generatedRows.length) {
+    const outputRows = buildCurrentOutputRows();
+    if (!outputRows.length) {
       return;
     }
     const chunkSize = 249;
-    const totalParts = Math.ceil(generatedRows.length / chunkSize);
+    const totalParts = Math.ceil(outputRows.length / chunkSize);
 
     for (let index = 0; index < totalParts; index += 1) {
       const start = index * chunkSize;
-      const chunk = generatedRows.slice(start, start + chunkSize);
+      const chunk = outputRows.slice(start, start + chunkSize);
       const csvBody = Papa.unparse(
         {
           fields: OUTLOOK_HEADERS,
@@ -797,32 +868,22 @@ export default function HomePage() {
                     </p>
                   </div>
                   {emailConflictRows.length > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setEmailOverrides((prev) => {
-                          const updated = { ...prev };
-                          emailConflictRows.forEach((conflict) => {
-                            const key = String(conflict.rowNumber);
-                            if (updated[key]) {
-                              return;
-                            }
-                            const alternate = getAlternateEmail(conflict.nombre, conflict.apellido);
-                            if (!alternate) {
-                              return;
-                            }
-                            if (normalizeEmail(alternate) === conflict.generatedEmail) {
-                              return;
-                            }
-                            updated[key] = alternate;
-                          });
-                          return updated;
-                        });
-                      }}
-                      className="rounded-full border border-ink/20 bg-white/80 px-4 py-2 text-sm font-semibold text-ink transition hover:border-ink/40"
-                    >
-                      Usar segundo nombre + primer apellido
-                    </button>
+                    <div className="flex flex-wrap gap-3">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const hasChanges = Object.keys(emailOverrides).length > 0;
+                          if (hasChanges) {
+                            setPendingBulkAction("correlative");
+                            return;
+                          }
+                          applyCorrelativeOverrides();
+                        }}
+                        className="rounded-full border border-ink/20 bg-white/80 px-4 py-2 text-sm font-semibold text-ink transition hover:border-ink/40"
+                      >
+                        Usar correlativo (+2)
+                      </button>
+                    </div>
                   )}
                 </div>
                 <div className="mt-3">
@@ -1048,6 +1109,53 @@ export default function HomePage() {
           </div>
         </section>
       </div>
+
+      {pendingBulkAction && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/30 px-4">
+          <div className="w-full max-w-md rounded-2xl border border-ink/10 bg-white p-6 shadow-lg">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h4 className="text-lg font-semibold text-ink">Cambiar sugerencias</h4>
+                <p className="mt-2 text-sm text-ink/70">
+                  Estas a punto de reemplazar todos los correos editados por nuevas
+                  sugerencias. Si quieres conservar tus cambios, puedes cancelar.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPendingBulkAction(null)}
+                className="text-sm font-semibold text-ink/60 transition hover:text-ink"
+                aria-label="Cerrar"
+              >
+                X
+              </button>
+            </div>
+            <div className="mt-5 flex flex-wrap justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setPendingBulkAction(null)}
+                className="rounded-full border border-ink/20 bg-white px-4 py-2 text-sm font-semibold text-ink transition hover:border-ink/40"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (pendingBulkAction === "secondName") {
+                    applySecondNameOverrides();
+                  } else if (pendingBulkAction === "correlative") {
+                    applyCorrelativeOverrides();
+                  }
+                  setPendingBulkAction(null);
+                }}
+                className="rounded-full bg-coral px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:brightness-95"
+              >
+                Reemplazar sugerencias
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }
