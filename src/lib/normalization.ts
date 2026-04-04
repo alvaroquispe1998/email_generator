@@ -21,23 +21,34 @@ function secondWord(value: string): string {
   return normalizedWords(value)[1] ?? "";
 }
 
-export function buildUsername(nombres: string, apellidos: string): string {
+function compactWords(value: string): string {
+  return normalizedWords(value).join("");
+}
+
+export function getLeadingWord(value: string): string {
+  return firstWord(value);
+}
+
+export function buildUsername(nombres: string, apellidoParaUsuario: string): string {
   const firstName = firstWord(nombres);
-  const firstSurname = firstWord(apellidos);
-  if (!firstName || !firstSurname) {
+  const surname = compactWords(apellidoParaUsuario);
+  if (!firstName || !surname) {
     return "";
   }
-  const local = `${firstName}.${firstSurname}`.replace(/[^a-z0-9.]/g, "");
+  const local = `${firstName}.${surname}`.replace(/[^a-z0-9.]/g, "");
   return `${local}@autonomadeica.edu.pe`;
 }
 
-export function buildUsernameWithSecondName(nombres: string, apellidos: string): string {
+export function buildUsernameWithSecondName(
+  nombres: string,
+  apellidoParaUsuario: string
+): string {
   const secondName = secondWord(nombres);
-  const firstSurname = firstWord(apellidos);
-  if (!secondName || !firstSurname) {
+  const surname = compactWords(apellidoParaUsuario);
+  if (!secondName || !surname) {
     return "";
   }
-  const local = `${secondName}.${firstSurname}`.replace(/[^a-z0-9.]/g, "");
+  const local = `${secondName}.${surname}`.replace(/[^a-z0-9.]/g, "");
   return `${local}@autonomadeica.edu.pe`;
 }
 

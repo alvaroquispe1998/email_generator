@@ -13,6 +13,10 @@ const GENERATED_LABELS: Record<string, { label: string; value: string }> = {
     label: "Generado: usuario institucional",
     value: "username"
   },
+  Apellido: {
+    label: "Generado: a_paterno + a_materno",
+    value: "fullSurname"
+  },
   "Nombre para mostrar": {
     label: "Generado: Apellido + Nombre",
     value: "displayName"

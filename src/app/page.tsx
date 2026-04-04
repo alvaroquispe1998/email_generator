@@ -6,13 +6,13 @@ import { MappingEditor } from "@/components/MappingEditor";
 import { PreviewTable } from "@/components/PreviewTable";
 import {
   OUTLOOK_HEADERS,
+  buildAlternateGeneratedUsername,
   buildGeneratedUsername,
   buildOutputRow,
   buildOutputRows,
   type MappingConfig
 } from "@/lib/csv";
 import {
-  buildUsernameWithSecondName,
   digitsOnly,
   stripAccents,
   toCleanString
@@ -55,6 +55,7 @@ type ExistingStudentMatch = {
 
 type EmailConflictRow = {
   rowNumber: number;
+  row: DataRow;
   nombre: string;
   apellido: string;
   generatedEmail: string;
@@ -68,6 +69,7 @@ const DEFAULT_REQUIRED: RequiredConfig = {
 
 const GENERATED_BY_HEADER: Record<string, string> = {
   "Nombre de usuario": "username",
+  Apellido: "fullSurname",
   "Nombre para mostrar": "displayName"
 };
 
@@ -136,16 +138,21 @@ function normalizeStudentCode(value: string): string {
 
 function buildDefaultMapping(columns: string[]): MappingConfig {
   const nombre = findColumn(columns, ["NOMBRES", "NOMBRES COMPLETOS", "NOMBRE"]);
+  const apellidoPaterno = findColumn(columns, ["A_PATERNO", "APELLIDO PATERNO", "APELLIDO_PATERNO"]);
+  const apellidoMaterno = findColumn(columns, ["A_MATERNO", "APELLIDO MATERNO", "APELLIDO_MATERNO"]);
   const apellido = findColumn(columns, ["APELLIDOS", "APELLIDOS COMPLETOS", "APELLIDO"]);
   const celular = findColumn(columns, ["NUMERO DE CELULAR", "CELULAR", "TELEFONO MOVIL"]);
   const dni = findColumn(columns, ["DNI", "DOCUMENTO"]);
   const codigo = findColumn(columns, ["CODIGO DE ESTUDIANTE", "CODIGO ESTUDIANTE", "CODIGO"]);
   const correo = findColumn(columns, ["CORREO PERSONAL", "EMAIL PERSONAL", "MAIL"]);
+  const usesStructuredSurnames = Boolean(apellidoPaterno || apellidoMaterno);
 
   return {
     "Nombre de usuario": { type: "generated", value: GENERATED_BY_HEADER["Nombre de usuario"] },
     Nombre: { type: "column", value: nombre },
-    Apellido: { type: "column", value: apellido },
+    Apellido: usesStructuredSurnames
+      ? { type: "generated", value: GENERATED_BY_HEADER.Apellido }
+      : { type: "column", value: apellido },
     "Nombre para mostrar": { type: "generated", value: GENERATED_BY_HEADER["Nombre para mostrar"] },
     Puesto: { type: "fixed", value: "Estudiante" },
     Departamento: { type: "fixed", value: "" },
@@ -179,8 +186,8 @@ function getGeneratedEmail(row: DataRow, mapping: MappingConfig): string {
   return buildGeneratedUsername(row, mapping);
 }
 
-function getAlternateEmail(nombre: string, apellido: string): string {
-  return buildUsernameWithSecondName(nombre, apellido);
+function getAlternateEmail(row: DataRow, mapping: MappingConfig): string {
+  return buildAlternateGeneratedUsername(row, mapping);
 }
 
 function rowHasIngresoCondition(row: DataRow, conditionColumn: string): boolean {
@@ -198,6 +205,14 @@ function mergeMapping(defaults: MappingConfig, stored?: MappingConfig | null): M
   const merged: MappingConfig = { ...defaults };
   OUTLOOK_HEADERS.forEach((header) => {
     if (stored[header]) {
+      if (
+        header === "Apellido" &&
+        defaults[header]?.type === "generated" &&
+        defaults[header]?.value === GENERATED_BY_HEADER.Apellido
+      ) {
+        merged[header] = defaults[header];
+        return;
+      }
       merged[header] = stored[header];
     }
   });
@@ -493,6 +508,7 @@ export default function HomePage() {
         const { nombre, apellido } = getRowNameParts(row, mapping);
         return {
           rowNumber: row.__rowNumber,
+          row,
           nombre,
           apellido,
           generatedEmail
@@ -544,7 +560,7 @@ export default function HomePage() {
       const updated: Record<string, string> = {};
       emailConflictRows.forEach((conflict) => {
         const key = String(conflict.rowNumber);
-        const alternate = getAlternateEmail(conflict.nombre, conflict.apellido);
+        const alternate = getAlternateEmail(conflict.row, mapping);
         if (!alternate) {
           return;
         }

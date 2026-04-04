@@ -1,5 +1,12 @@
 import Papa from "papaparse";
-import { buildUsername, digitsOnly, toCleanString } from "./normalization";
+import {
+  buildUsername,
+  buildUsernameWithSecondName,
+  digitsOnly,
+  getLeadingWord,
+  stripAccents,
+  toCleanString
+} from "./normalization";
 import type { DataRow } from "./xlsx";
 
 export const OUTLOOK_HEADERS = [
@@ -30,7 +37,20 @@ export type MappingConfig = Record<string, MappingRule>;
 
 const GENERATED_USERNAME = "username";
 const GENERATED_DISPLAY = "displayName";
+const GENERATED_FULL_SURNAME = "fullSurname";
 const HEADER_MOBILE = "Tel\u00e9fono m\u00f3vil";
+const STRUCTURED_PATERNAL_COLUMNS = [
+  "a_paterno",
+  "apellido_paterno",
+  "apellido paterno",
+  "apaterno"
+];
+const STRUCTURED_MATERNAL_COLUMNS = [
+  "a_materno",
+  "apellido_materno",
+  "apellido materno",
+  "amaterno"
+];
 
 function resolveBaseValue(
   rule: MappingRule | undefined,
@@ -48,16 +68,90 @@ function resolveBaseValue(
   return "";
 }
 
+function normalizeSourceKey(value: string): string {
+  return stripAccents(value).toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function findStructuredValue(row: DataRow, candidates: string[]): string {
+  for (const candidate of candidates) {
+    const direct = row[candidate];
+    if (direct !== undefined) {
+      const value = toCleanString(direct);
+      if (value) {
+        return value;
+      }
+    }
+  }
+
+  const candidateKeys = candidates.map(normalizeSourceKey);
+  for (const [key, rawValue] of Object.entries(row)) {
+    if (key === "__rowNumber") {
+      continue;
+    }
+    if (!candidateKeys.includes(normalizeSourceKey(key))) {
+      continue;
+    }
+    const value = toCleanString(rawValue);
+    if (value) {
+      return value;
+    }
+  }
+
+  return "";
+}
+
+function getStructuredSurnames(row: DataRow): {
+  paterno: string;
+  materno: string;
+  completo: string;
+} {
+  const paterno = findStructuredValue(row, STRUCTURED_PATERNAL_COLUMNS);
+  const materno = findStructuredValue(row, STRUCTURED_MATERNAL_COLUMNS);
+  return {
+    paterno,
+    materno,
+    completo: [paterno, materno].filter(Boolean).join(" ").trim()
+  };
+}
+
+function resolveSurnameValue(row: DataRow, mapping: MappingConfig): string {
+  const rule = mapping["Apellido"];
+  const structured = getStructuredSurnames(row);
+
+  if (rule?.type === "generated" && rule.value === GENERATED_FULL_SURNAME) {
+    return structured.completo;
+  }
+
+  return resolveBaseValue(rule, row);
+}
+
+function resolveUsernameSurname(row: DataRow, mapping: MappingConfig): string {
+  const structured = getStructuredSurnames(row);
+  if (structured.paterno) {
+    return structured.paterno;
+  }
+
+  const apellido = resolveSurnameValue(row, mapping);
+  return getLeadingWord(apellido);
+}
+
 export function buildGeneratedUsername(row: DataRow, mapping: MappingConfig): string {
   const nombre = resolveBaseValue(mapping["Nombre"], row);
-  const apellido = resolveBaseValue(mapping["Apellido"], row);
-  return buildUsername(nombre, apellido);
+  const apellidoParaUsuario = resolveUsernameSurname(row, mapping);
+  return buildUsername(nombre, apellidoParaUsuario);
+}
+
+export function buildAlternateGeneratedUsername(row: DataRow, mapping: MappingConfig): string {
+  const nombre = resolveBaseValue(mapping["Nombre"], row);
+  const apellidoParaUsuario = resolveUsernameSurname(row, mapping);
+  return buildUsernameWithSecondName(nombre, apellidoParaUsuario);
 }
 
 export function buildOutputRow(row: DataRow, mapping: MappingConfig): Record<string, string> {
   const nombre = resolveBaseValue(mapping["Nombre"], row);
-  const apellido = resolveBaseValue(mapping["Apellido"], row);
-  const username = buildUsername(nombre, apellido);
+  const apellido = resolveSurnameValue(row, mapping);
+  const apellidoParaUsuario = resolveUsernameSurname(row, mapping);
+  const username = buildUsername(nombre, apellidoParaUsuario);
   const displayName = [apellido, nombre].filter(Boolean).join(" ").trim();
 
   const output: Record<string, string> = {};
@@ -71,6 +165,8 @@ export function buildOutputRow(row: DataRow, mapping: MappingConfig): Record<str
         value = username;
       } else if (rule.value === GENERATED_DISPLAY) {
         value = displayName;
+      } else if (rule.value === GENERATED_FULL_SURNAME) {
+        value = apellido;
       }
     } else {
       value = resolveBaseValue(rule, row);
@@ -114,5 +210,6 @@ export function generateCsvText(rows: DataRow[], mapping: MappingConfig): string
 
 export const GENERATED_OPTIONS = {
   username: GENERATED_USERNAME,
-  displayName: GENERATED_DISPLAY
+  displayName: GENERATED_DISPLAY,
+  fullSurname: GENERATED_FULL_SURNAME
 };
