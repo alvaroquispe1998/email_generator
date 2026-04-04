@@ -37,16 +37,20 @@ type ValidationIssue = {
 type OutlookDirectory = {
   fileName: string;
   rowCount: number;
-  dnis: Set<string>;
   emails: Set<string>;
+  emailByDni: Map<string, string>;
+  emailByCode: Map<string, string>;
   error: string | null;
 };
 
-type ExistingDniMatch = {
+type ExistingStudentMatch = {
   rowNumber: number;
   dni: string;
+  codigo: string;
   nombre: string;
   apellido: string;
+  matchReason: string;
+  existingEmail: string;
 };
 
 type EmailConflictRow = {
@@ -74,6 +78,14 @@ function normalizeKey(value: string): string {
 function normalizeValue(value: string): string {
   return stripAccents(value).toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
+
+const POSTAL_HEADER =
+  OUTLOOK_HEADERS.find((header) => normalizeKey(header) === "CODIGOPOSTAL") ??
+  "Codigo postal";
+const MOBILE_HEADER =
+  OUTLOOK_HEADERS.find((header) => normalizeKey(header) === "TELEFONOMOVIL") ??
+  "Telefono movil";
+const EMPTY_DIRECTORY_MAP = new Map<string, string>();
 
 function normalizeEmail(value: string): string {
   const cleaned = stripAccents(toCleanString(value)).toLowerCase();
@@ -118,6 +130,10 @@ function findColumn(columns: string[], candidates: string[]): string {
   return found ?? "";
 }
 
+function normalizeStudentCode(value: string): string {
+  return stripAccents(toCleanString(value)).toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
 function buildDefaultMapping(columns: string[]): MappingConfig {
   const nombre = findColumn(columns, ["NOMBRES", "NOMBRES COMPLETOS", "NOMBRE"]);
   const apellido = findColumn(columns, ["APELLIDOS", "APELLIDOS COMPLETOS", "APELLIDO"]);
@@ -154,9 +170,9 @@ function getRowNameParts(row: DataRow, mapping: MappingConfig): { nombre: string
   };
 }
 
-function getRowDni(row: DataRow, mapping: MappingConfig): string {
+function getRowStudentCode(row: DataRow, mapping: MappingConfig): string {
   const output = buildOutputRow(row, mapping);
-  return digitsOnly(toCleanString(output["Fax"]));
+  return toCleanString(output[POSTAL_HEADER]);
 }
 
 function getGeneratedEmail(row: DataRow, mapping: MappingConfig): string {
@@ -217,12 +233,34 @@ function sanitizeMapping(
   return sanitized;
 }
 
+function findExistingStudent(
+  output: Record<string, string>,
+  emailByDni: Map<string, string>,
+  emailByCode: Map<string, string>
+): { existingEmail: string; matchReason: string } | null {
+  const dni = digitsOnly(toCleanString(output["Fax"]));
+  const codigo = normalizeStudentCode(output[POSTAL_HEADER] ?? "");
+  const matchByDni = dni ? emailByDni.get(dni) ?? "" : "";
+  const matchByCode = codigo ? emailByCode.get(codigo) ?? "" : "";
+
+  if (!matchByDni && !matchByCode) {
+    return null;
+  }
+
+  return {
+    existingEmail: matchByDni || matchByCode,
+    matchReason:
+      matchByDni && matchByCode ? "DNI y codigo" : matchByDni ? "DNI" : "Codigo"
+  };
+}
+
 function validateRows(
   rows: DataRow[],
   mapping: MappingConfig,
   required: RequiredConfig,
   conditionColumn: string,
-  existingDnis: Set<string>
+  emailByDni: Map<string, string>,
+  emailByCode: Map<string, string>
 ): ValidationIssue[] {
   return rows
     .map((row) => {
@@ -230,8 +268,7 @@ function validateRows(
         return null;
       }
       const output = buildOutputRow(row, mapping);
-      const dniValue = digitsOnly(toCleanString(output["Fax"]));
-      if (dniValue && existingDnis.has(dniValue)) {
+      if (findExistingStudent(output, emailByDni, emailByCode)) {
         return null;
       }
       const missing: string[] = [];
@@ -239,11 +276,11 @@ function validateRows(
       if (required.dni && !toCleanString(output["Fax"])) {
         missing.push("DNI");
       }
-      if (required.celular && !toCleanString(output["Teléfono móvil"])) {
+      if (required.celular && !toCleanString(output[MOBILE_HEADER])) {
         missing.push("Celular");
       }
-      if (required.codigo && !toCleanString(output["Código postal"])) {
-        missing.push("Código estudiante");
+      if (required.codigo && !toCleanString(output[POSTAL_HEADER])) {
+        missing.push("Codigo estudiante");
       }
 
       if (missing.length === 0) {
@@ -259,24 +296,24 @@ function rowMeetsRequired(
   mapping: MappingConfig,
   required: RequiredConfig,
   conditionColumn: string,
-  existingDnis: Set<string>
+  emailByDni: Map<string, string>,
+  emailByCode: Map<string, string>
 ): boolean {
   if (!rowHasIngresoCondition(row, conditionColumn)) {
     return false;
   }
   const output = buildOutputRow(row, mapping);
-  const dniValue = digitsOnly(toCleanString(output["Fax"]));
-  if (dniValue && existingDnis.has(dniValue)) {
+  if (findExistingStudent(output, emailByDni, emailByCode)) {
     return false;
   }
 
   if (required.dni && !toCleanString(output["Fax"])) {
     return false;
   }
-  if (required.celular && !toCleanString(output["Teléfono móvil"])) {
+  if (required.celular && !toCleanString(output[MOBILE_HEADER])) {
     return false;
   }
-  if (required.codigo && !toCleanString(output["Código postal"])) {
+  if (required.codigo && !toCleanString(output[POSTAL_HEADER])) {
     return false;
   }
 
@@ -288,10 +325,11 @@ function filterRowsForExport(
   mapping: MappingConfig,
   required: RequiredConfig,
   conditionColumn: string,
-  existingDnis: Set<string>
+  emailByDni: Map<string, string>,
+  emailByCode: Map<string, string>
 ): DataRow[] {
   return rows.filter((row) =>
-    rowMeetsRequired(row, mapping, required, conditionColumn, existingDnis)
+    rowMeetsRequired(row, mapping, required, conditionColumn, emailByDni, emailByCode)
   );
 }
 
@@ -400,16 +438,17 @@ export default function HomePage() {
     () => findColumn(columns, ["CONDICION", "CONDICIÓN"]),
     [columns]
   );
-  const existingDnis = outlookDirectory?.dnis ?? EMPTY_SET;
   const existingEmails = outlookDirectory?.emails ?? EMPTY_SET;
+  const emailByDni = outlookDirectory?.emailByDni ?? EMPTY_DIRECTORY_MAP;
+  const emailByCode = outlookDirectory?.emailByCode ?? EMPTY_DIRECTORY_MAP;
 
   const validationIssues = useMemo(
-    () => validateRows(rows, mapping, required, conditionColumn, existingDnis),
-    [rows, mapping, required, conditionColumn, existingDnis]
+    () => validateRows(rows, mapping, required, conditionColumn, emailByDni, emailByCode),
+    [rows, mapping, required, conditionColumn, emailByDni, emailByCode]
   );
   const baseExportRows = useMemo(
-    () => filterRowsForExport(rows, mapping, required, conditionColumn, existingDnis),
-    [rows, mapping, required, conditionColumn, existingDnis]
+    () => filterRowsForExport(rows, mapping, required, conditionColumn, emailByDni, emailByCode),
+    [rows, mapping, required, conditionColumn, emailByDni, emailByCode]
   );
   const totalCsvParts = useMemo(() => {
     if (!generatedRows.length) {
@@ -417,27 +456,30 @@ export default function HomePage() {
     }
     return Math.ceil(generatedRows.length / 249);
   }, [generatedRows.length]);
-  const existingDniMatches = useMemo(() => {
-    if (!existingDnis.size) {
-      return [] as ExistingDniMatch[];
+  const existingStudentMatches = useMemo(() => {
+    if (!emailByDni.size && !emailByCode.size) {
+      return [] as ExistingStudentMatch[];
     }
     return rows
       .filter((row) => rowHasIngresoCondition(row, conditionColumn))
       .map((row) => {
-        const dni = getRowDni(row, mapping);
-        if (!dni || !existingDnis.has(dni)) {
+        const output = buildOutputRow(row, mapping);
+        const existingStudent = findExistingStudent(output, emailByDni, emailByCode);
+        if (!existingStudent) {
           return null;
         }
-        const { nombre, apellido } = getRowNameParts(row, mapping);
         return {
           rowNumber: row.__rowNumber,
-          dni,
-          nombre,
-          apellido
+          dni: digitsOnly(toCleanString(output["Fax"])),
+          codigo: getRowStudentCode(row, mapping),
+          nombre: toCleanString(output["Nombre"]),
+          apellido: toCleanString(output["Apellido"]),
+          matchReason: existingStudent.matchReason,
+          existingEmail: existingStudent.existingEmail
         };
       })
-      .filter(Boolean) as ExistingDniMatch[];
-  }, [rows, mapping, conditionColumn, existingDnis]);
+      .filter(Boolean) as ExistingStudentMatch[];
+  }, [rows, mapping, conditionColumn, emailByDni, emailByCode]);
   const emailConflictRows = useMemo(() => {
     if (!existingEmails.size) {
       return [] as EmailConflictRow[];
@@ -566,49 +608,71 @@ export default function HomePage() {
       });
       const fields = parsed.meta.fields ?? [];
       const faxField = findColumn(fields, ["Fax", "FAX"]);
+      const postalField = findColumn(fields, [
+        "Postal code",
+        "PostalCode",
+        "Codigo postal",
+        "Codigo estudiante"
+      ]);
       const upnField = findColumn(fields, [
         "User principal name",
         "UserPrincipalName",
         "User principalname"
       ]);
 
-      if (!faxField || !upnField) {
+      if (!upnField || (!faxField && !postalField)) {
         setOutlookDirectory({
           fileName: file.name,
           rowCount: parsed.data.length,
-          dnis: new Set(),
           emails: new Set(),
-          error: "No se encontraron las columnas Fax y User principal name en el CSV."
+          emailByDni: new Map(),
+          emailByCode: new Map(),
+          error:
+            "No se encontraron User principal name y al menos una columna de cruce (Fax o Postal code) en el CSV."
         });
         return;
       }
 
-      const dnis = new Set<string>();
       const emails = new Set<string>();
+      const emailByDni = new Map<string, string>();
+      const emailByCode = new Map<string, string>();
       parsed.data.forEach((row) => {
-        const dni = digitsOnly(toCleanString(row[faxField] ?? ""));
-        if (dni) {
-          dnis.add(dni);
-        }
         const email = normalizeEmail(row[upnField] ?? "");
         if (email) {
           emails.add(email);
+        }
+        if (!email) {
+          return;
+        }
+        if (faxField) {
+          const dni = digitsOnly(toCleanString(row[faxField] ?? ""));
+          if (dni && !emailByDni.has(dni)) {
+            emailByDni.set(dni, email);
+          }
+        }
+        if (postalField) {
+          const codigo = normalizeStudentCode(row[postalField] ?? "");
+          if (codigo && !emailByCode.has(codigo)) {
+            emailByCode.set(codigo, email);
+          }
         }
       });
 
       setOutlookDirectory({
         fileName: file.name,
         rowCount: parsed.data.length,
-        dnis,
         emails,
+        emailByDni,
+        emailByCode,
         error: null
       });
     } catch {
       setOutlookDirectory({
         fileName: file.name,
         rowCount: 0,
-        dnis: new Set(),
         emails: new Set(),
+        emailByDni: new Map(),
+        emailByCode: new Map(),
         error: "No se pudo leer el CSV de Outlook."
       });
     }
@@ -774,7 +838,7 @@ export default function HomePage() {
             <div>
               <h2 className="text-xl font-semibold text-ink">2. Validar con CSV de Outlook</h2>
               <p className="text-sm text-ink/70">
-                Sube el CSV exportado de Outlook para detectar DNI y correos existentes.
+                Sube el CSV exportado de Outlook para detectar alumnos con correo por DNI o codigo y correos ya usados.
               </p>
             </div>
             <label className="inline-flex cursor-pointer items-center gap-2 rounded-full border border-ink/20 bg-white px-4 py-2 text-sm font-semibold text-ink transition hover:border-ink/40">
@@ -799,7 +863,8 @@ export default function HomePage() {
               <div className="rounded-2xl border border-ink/10 bg-sand/70 px-4 py-3 text-sm text-ink/80">
                 <div>Archivo: {outlookDirectory.fileName}</div>
                 <div>Registros leídos: {outlookDirectory.rowCount}</div>
-                <div>DNI detectados: {outlookDirectory.dnis.size}</div>
+                <div>DNI con correo detectados: {outlookDirectory.emailByDni.size}</div>
+                <div>Codigos con correo detectados: {outlookDirectory.emailByCode.size}</div>
                 <div>Correos detectados: {outlookDirectory.emails.size}</div>
               </div>
               {outlookDirectory.error && (
@@ -814,15 +879,15 @@ export default function HomePage() {
             <div className="mt-6 space-y-6">
               <div>
                 <h3 className="text-base font-semibold text-ink">
-                  Personal ya existente (por DNI)
+                  Estudiantes con correo existente
                 </h3>
                 <p className="text-sm text-ink/70">
-                  Estas filas no se contarán en el CSV final.
+                  Estas filas no se mostraran como exportables ni se incluiran en el CSV final.
                 </p>
                 <div className="mt-3">
-                  {existingDniMatches.length === 0 ? (
+                  {existingStudentMatches.length === 0 ? (
                     <div className="rounded-2xl border border-ink/10 bg-white/70 px-4 py-3 text-sm text-ink/70">
-                      No se encontraron coincidencias de DNI.
+                      No se encontraron estudiantes con correo existente.
                     </div>
                   ) : (
                     <div className="overflow-x-auto rounded-2xl border border-white/60 bg-white/70">
@@ -836,20 +901,34 @@ export default function HomePage() {
                               DNI
                             </th>
                             <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">
+                              Codigo estudiante
+                            </th>
+                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">
                               Apellido
                             </th>
                             <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">
                               Nombre
                             </th>
+                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">
+                              Coincidencia
+                            </th>
+                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">
+                              Correo existente
+                            </th>
                           </tr>
                         </thead>
                         <tbody>
-                          {existingDniMatches.map((match) => (
+                          {existingStudentMatches.map((match) => (
                             <tr key={match.rowNumber} className="border-t border-white/60">
                               <td className="px-4 py-2 text-ink/90">{match.rowNumber}</td>
                               <td className="px-4 py-2 text-ink/90">{match.dni}</td>
+                              <td className="px-4 py-2 text-ink/90">{match.codigo || "-"}</td>
                               <td className="px-4 py-2 text-ink/90">{match.apellido || "-"}</td>
                               <td className="px-4 py-2 text-ink/90">{match.nombre || "-"}</td>
+                              <td className="px-4 py-2 text-ink/90">{match.matchReason}</td>
+                              <td className="px-4 py-2 text-ink/90">
+                                {match.existingEmail || "-"}
+                              </td>
                             </tr>
                           ))}
                         </tbody>
@@ -1070,7 +1149,7 @@ export default function HomePage() {
                 Genera el CSV con el orden exacto de Outlook y revisa el preview.
               </p>
               <p className="text-sm text-ink/70">
-                Filas exportables: {exportRows.length} de {rows.length} según condición INGRESÓ, campos obligatorios, sin DNI existente, sin correos ya usados y sin duplicados internos.
+                Filas exportables: {exportRows.length} de {rows.length} segun condicion INGRESO, campos obligatorios, sin alumnos con correo existente por DNI o codigo, sin correos ya usados y sin duplicados internos.
               </p>
               {totalCsvParts > 0 && (
                 <p className="text-sm text-ink/70">
