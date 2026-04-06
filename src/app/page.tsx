@@ -5,7 +5,10 @@ import Papa from "papaparse";
 import { MappingEditor } from "@/components/MappingEditor";
 import { PreviewTable } from "@/components/PreviewTable";
 import {
+  MATERNAL_SURNAME_HEADER,
+  MAPPING_HEADERS,
   OUTLOOK_HEADERS,
+  PATERNAL_SURNAME_HEADER,
   buildAlternateGeneratedUsername,
   buildGeneratedUsername,
   buildOutputRow,
@@ -13,35 +16,33 @@ import {
   type MappingConfig
 } from "@/lib/csv";
 import {
-  digitsOnly,
-  stripAccents,
-  toCleanString
-} from "@/lib/normalization";
+  buildPlannedEmailCounts,
+  filterRowsByEmail,
+  filterRowsForExport,
+  findExistingStudent,
+  findInternalDuplicateRows,
+  type InternalDuplicateRow,
+  type RequiredConfig,
+  type ValidationIssue,
+  validateRows
+} from "@/lib/export-validation";
+import { findBestColumn, normalizeLookupKey } from "@/lib/matching";
+import { digitsOnly, toCleanString } from "@/lib/normalization";
+import {
+  buildCorrelativeEmail,
+  buildOutlookDirectoryData,
+  normalizeEmail,
+  type OutlookDirectoryData,
+  type OutlookIdentifierConflict
+} from "@/lib/outlook";
 import { parseWorkbook, type DataRow, type WorkbookData } from "@/lib/xlsx";
 
 const STORAGE_MAPPING = "outlook-mapping-v1";
 const STORAGE_REQUIRED = "outlook-required-v1";
 const EMPTY_SET = new Set<string>();
+const EMPTY_DIRECTORY_MAP = new Map<string, string>();
 
-type RequiredConfig = {
-  dni: boolean;
-  celular: boolean;
-  codigo: boolean;
-};
-
-type ValidationIssue = {
-  rowNumber: number;
-  missing: string[];
-};
-
-type OutlookDirectory = {
-  fileName: string;
-  rowCount: number;
-  emails: Set<string>;
-  emailByDni: Map<string, string>;
-  emailByCode: Map<string, string>;
-  error: string | null;
-};
+type OutlookDirectory = OutlookDirectoryData & { fileName: string };
 
 type ExistingStudentMatch = {
   rowNumber: number;
@@ -61,11 +62,7 @@ type EmailConflictRow = {
   generatedEmail: string;
 };
 
-const DEFAULT_REQUIRED: RequiredConfig = {
-  dni: true,
-  celular: true,
-  codigo: true
-};
+const DEFAULT_REQUIRED: RequiredConfig = { dni: true, celular: true, codigo: true };
 
 const GENERATED_BY_HEADER: Record<string, string> = {
   "Nombre de usuario": "username",
@@ -73,83 +70,29 @@ const GENERATED_BY_HEADER: Record<string, string> = {
   "Nombre para mostrar": "displayName"
 };
 
-function normalizeKey(value: string): string {
-  return stripAccents(value).toUpperCase().replace(/[^A-Z0-9]/g, "");
-}
-
-function normalizeValue(value: string): string {
-  return stripAccents(value).toUpperCase().replace(/[^A-Z0-9]/g, "");
-}
-
 const POSTAL_HEADER =
-  OUTLOOK_HEADERS.find((header) => normalizeKey(header) === "CODIGOPOSTAL") ??
-  "Codigo postal";
+  OUTLOOK_HEADERS.find((header) => normalizeLookupKey(header) === "CODIGOPOSTAL") ??
+  "Código postal";
 const MOBILE_HEADER =
-  OUTLOOK_HEADERS.find((header) => normalizeKey(header) === "TELEFONOMOVIL") ??
-  "Telefono movil";
-const EMPTY_DIRECTORY_MAP = new Map<string, string>();
-
-function normalizeEmail(value: string): string {
-  const cleaned = stripAccents(toCleanString(value)).toLowerCase();
-  if (!cleaned) {
-    return "";
-  }
-  const [localRaw, domainRaw] = cleaned.split("@");
-  const local = (localRaw || "").replace(/[^a-z0-9.]/g, "");
-  const domain = (domainRaw || "").replace(/[^a-z0-9.]/g, "");
-  if (!domainRaw) {
-    return local;
-  }
-  return `${local}@${domain}`;
-}
-
-function buildCorrelativeEmail(baseEmail: string, usedEmails: Set<string>): string {
-  const normalized = normalizeEmail(baseEmail);
-  if (!normalized) {
-    return "";
-  }
-  const [local, domain] = normalized.split("@");
-  if (!local || !domain) {
-    return "";
-  }
-  for (let index = 2; index < 1000; index += 1) {
-    const candidate = `${local}${index}@${domain}`;
-    if (!usedEmails.has(candidate)) {
-      return candidate;
-    }
-  }
-  return "";
-}
-
-function findColumn(columns: string[], candidates: string[]): string {
-  const normalizedCandidates = candidates.map(normalizeKey);
-  const found = columns.find((column) => {
-    const normalizedColumn = normalizeKey(column);
-    return normalizedCandidates.some((candidate) =>
-      normalizedColumn.includes(candidate)
-    );
-  });
-  return found ?? "";
-}
-
-function normalizeStudentCode(value: string): string {
-  return stripAccents(toCleanString(value)).toUpperCase().replace(/[^A-Z0-9]/g, "");
-}
+  OUTLOOK_HEADERS.find((header) => normalizeLookupKey(header) === "TELEFONOMOVIL") ??
+  "Teléfono móvil";
 
 function buildDefaultMapping(columns: string[]): MappingConfig {
-  const nombre = findColumn(columns, ["NOMBRES", "NOMBRES COMPLETOS", "NOMBRE"]);
-  const apellidoPaterno = findColumn(columns, ["A_PATERNO", "APELLIDO PATERNO", "APELLIDO_PATERNO"]);
-  const apellidoMaterno = findColumn(columns, ["A_MATERNO", "APELLIDO MATERNO", "APELLIDO_MATERNO"]);
-  const apellido = findColumn(columns, ["APELLIDOS", "APELLIDOS COMPLETOS", "APELLIDO"]);
-  const celular = findColumn(columns, ["NUMERO DE CELULAR", "CELULAR", "TELEFONO MOVIL"]);
-  const dni = findColumn(columns, ["DNI", "DOCUMENTO"]);
-  const codigo = findColumn(columns, ["CODIGO DE ESTUDIANTE", "CODIGO ESTUDIANTE", "CODIGO"]);
-  const correo = findColumn(columns, ["CORREO PERSONAL", "EMAIL PERSONAL", "MAIL"]);
+  const nombre = findBestColumn(columns, ["NOMBRES", "NOMBRES COMPLETOS", "NOMBRE"]);
+  const apellidoPaterno = findBestColumn(columns, ["A_PATERNO", "APELLIDO PATERNO", "APELLIDO_PATERNO"]);
+  const apellidoMaterno = findBestColumn(columns, ["A_MATERNO", "APELLIDO MATERNO", "APELLIDO_MATERNO"]);
+  const apellido = findBestColumn(columns, ["APELLIDOS", "APELLIDOS COMPLETOS", "APELLIDO"]);
+  const celular = findBestColumn(columns, ["NUMERO DE CELULAR", "CELULAR", "TELEFONO MOVIL"]);
+  const dni = findBestColumn(columns, ["DNI", "DOCUMENTO"]);
+  const codigo = findBestColumn(columns, ["CODIGO DE ESTUDIANTE", "CODIGO ESTUDIANTE", "CODIGO"]);
+  const correo = findBestColumn(columns, ["CORREO PERSONAL", "EMAIL PERSONAL", "MAIL"]);
   const usesStructuredSurnames = Boolean(apellidoPaterno || apellidoMaterno);
 
   return {
     "Nombre de usuario": { type: "generated", value: GENERATED_BY_HEADER["Nombre de usuario"] },
     Nombre: { type: "column", value: nombre },
+    [PATERNAL_SURNAME_HEADER]: { type: "column", value: apellidoPaterno },
+    [MATERNAL_SURNAME_HEADER]: { type: "column", value: apellidoMaterno },
     Apellido: usesStructuredSurnames
       ? { type: "generated", value: GENERATED_BY_HEADER.Apellido }
       : { type: "column", value: apellido },
@@ -165,11 +108,11 @@ function buildDefaultMapping(columns: string[]): MappingConfig {
     Ciudad: { type: "fixed", value: "" },
     "Estado o provincia": { type: "fixed", value: "" },
     "Código postal": { type: "column", value: codigo },
-    "País o región": { type: "fixed", value: "Peru" }
+    "País o región": { type: "fixed", value: "Perú" }
   };
 }
 
-function getRowNameParts(row: DataRow, mapping: MappingConfig): { nombre: string; apellido: string } {
+function getRowNameParts(row: DataRow, mapping: MappingConfig) {
   const output = buildOutputRow(row, mapping);
   return {
     nombre: toCleanString(output["Nombre"]),
@@ -178,8 +121,7 @@ function getRowNameParts(row: DataRow, mapping: MappingConfig): { nombre: string
 }
 
 function getRowStudentCode(row: DataRow, mapping: MappingConfig): string {
-  const output = buildOutputRow(row, mapping);
-  return toCleanString(output[POSTAL_HEADER]);
+  return toCleanString(buildOutputRow(row, mapping)[POSTAL_HEADER]);
 }
 
 function getGeneratedEmail(row: DataRow, mapping: MappingConfig): string {
@@ -190,50 +132,37 @@ function getAlternateEmail(row: DataRow, mapping: MappingConfig): string {
   return buildAlternateGeneratedUsername(row, mapping);
 }
 
-function rowHasIngresoCondition(row: DataRow, conditionColumn: string): boolean {
-  if (!conditionColumn) {
-    return true;
-  }
-  const value = toCleanString(row[conditionColumn]);
-  return normalizeValue(value) === "INGRESO";
-}
-
 function mergeMapping(defaults: MappingConfig, stored?: MappingConfig | null): MappingConfig {
   if (!stored) {
     return defaults;
   }
   const merged: MappingConfig = { ...defaults };
-  OUTLOOK_HEADERS.forEach((header) => {
-    if (stored[header]) {
-      if (
-        header === "Apellido" &&
-        defaults[header]?.type === "generated" &&
-        defaults[header]?.value === GENERATED_BY_HEADER.Apellido
-      ) {
-        merged[header] = defaults[header];
-        return;
-      }
-      merged[header] = stored[header];
+  MAPPING_HEADERS.forEach((header) => {
+    if (!stored[header]) {
+      return;
     }
+    if (
+      header === "Apellido" &&
+      defaults[header]?.type === "generated" &&
+      defaults[header]?.value === GENERATED_BY_HEADER.Apellido
+    ) {
+      merged[header] = defaults[header];
+      return;
+    }
+    merged[header] = stored[header];
   });
   return merged;
 }
 
-function sanitizeMapping(
-  mapping: MappingConfig,
-  columns: string[],
-  defaults: MappingConfig
-): MappingConfig {
+function sanitizeMapping(mapping: MappingConfig, columns: string[], defaults: MappingConfig) {
   const sanitized: MappingConfig = { ...defaults };
-  OUTLOOK_HEADERS.forEach((header) => {
+  MAPPING_HEADERS.forEach((header) => {
     const rule = mapping[header];
     if (!rule) {
       return;
     }
     if (rule.type === "column") {
-      sanitized[header] = columns.includes(rule.value)
-        ? rule
-        : { type: "column", value: "" };
+      sanitized[header] = columns.includes(rule.value) ? rule : { type: "column", value: "" };
       return;
     }
     if (rule.type === "generated") {
@@ -241,140 +170,13 @@ function sanitizeMapping(
       sanitized[header] = allowed && rule.value === allowed ? rule : defaults[header];
       return;
     }
-    if (rule.type === "fixed") {
-      sanitized[header] = rule;
-    }
+    sanitized[header] = rule;
   });
   return sanitized;
 }
 
-function findExistingStudent(
-  output: Record<string, string>,
-  emailByDni: Map<string, string>,
-  emailByCode: Map<string, string>
-): { existingEmail: string; matchReason: string } | null {
-  const dni = digitsOnly(toCleanString(output["Fax"]));
-  const codigo = normalizeStudentCode(output[POSTAL_HEADER] ?? "");
-  const matchByDni = dni ? emailByDni.get(dni) ?? "" : "";
-  const matchByCode = codigo ? emailByCode.get(codigo) ?? "" : "";
-
-  if (!matchByDni && !matchByCode) {
-    return null;
-  }
-
-  return {
-    existingEmail: matchByDni || matchByCode,
-    matchReason:
-      matchByDni && matchByCode ? "DNI y codigo" : matchByDni ? "DNI" : "Codigo"
-  };
-}
-
-function validateRows(
-  rows: DataRow[],
-  mapping: MappingConfig,
-  required: RequiredConfig,
-  conditionColumn: string,
-  emailByDni: Map<string, string>,
-  emailByCode: Map<string, string>
-): ValidationIssue[] {
-  return rows
-    .map((row) => {
-      if (!rowHasIngresoCondition(row, conditionColumn)) {
-        return null;
-      }
-      const output = buildOutputRow(row, mapping);
-      if (findExistingStudent(output, emailByDni, emailByCode)) {
-        return null;
-      }
-      const missing: string[] = [];
-
-      if (required.dni && !toCleanString(output["Fax"])) {
-        missing.push("DNI");
-      }
-      if (required.celular && !toCleanString(output[MOBILE_HEADER])) {
-        missing.push("Celular");
-      }
-      if (required.codigo && !toCleanString(output[POSTAL_HEADER])) {
-        missing.push("Codigo estudiante");
-      }
-
-      if (missing.length === 0) {
-        return null;
-      }
-      return { rowNumber: row.__rowNumber, missing };
-    })
-    .filter(Boolean) as ValidationIssue[];
-}
-
-function rowMeetsRequired(
-  row: DataRow,
-  mapping: MappingConfig,
-  required: RequiredConfig,
-  conditionColumn: string,
-  emailByDni: Map<string, string>,
-  emailByCode: Map<string, string>
-): boolean {
-  if (!rowHasIngresoCondition(row, conditionColumn)) {
-    return false;
-  }
-  const output = buildOutputRow(row, mapping);
-  if (findExistingStudent(output, emailByDni, emailByCode)) {
-    return false;
-  }
-
-  if (required.dni && !toCleanString(output["Fax"])) {
-    return false;
-  }
-  if (required.celular && !toCleanString(output[MOBILE_HEADER])) {
-    return false;
-  }
-  if (required.codigo && !toCleanString(output[POSTAL_HEADER])) {
-    return false;
-  }
-
-  return true;
-}
-
-function filterRowsForExport(
-  rows: DataRow[],
-  mapping: MappingConfig,
-  required: RequiredConfig,
-  conditionColumn: string,
-  emailByDni: Map<string, string>,
-  emailByCode: Map<string, string>
-): DataRow[] {
-  return rows.filter((row) =>
-    rowMeetsRequired(row, mapping, required, conditionColumn, emailByDni, emailByCode)
-  );
-}
-
-function filterRowsByEmail(
-  rows: DataRow[],
-  mapping: MappingConfig,
-  emailOverrides: Record<string, string>,
-  existingEmails: Set<string>,
-  plannedEmailCounts: Map<string, number>
-): DataRow[] {
-  const seen = new Set<string>();
-  return rows.filter((row) => {
-    const key = String(row.__rowNumber);
-    const override = emailOverrides[key];
-    const email = normalizeEmail(override || getGeneratedEmail(row, mapping));
-    if (!email) {
-      return true;
-    }
-    if (existingEmails.has(email)) {
-      return false;
-    }
-    const count = plannedEmailCounts.get(email) ?? 0;
-    if (count > 1) {
-      if (seen.has(email)) {
-        return false;
-      }
-      seen.add(email);
-    }
-    return true;
-  });
+function formatConflictKind(kind: OutlookIdentifierConflict["kind"]): string {
+  return kind === "dni" ? "DNI" : "Código";
 }
 
 export default function HomePage() {
@@ -385,16 +187,14 @@ export default function HomePage() {
   const [mapping, setMapping] = useState<MappingConfig>(() => buildDefaultMapping([]));
   const [required, setRequired] = useState<RequiredConfig>(DEFAULT_REQUIRED);
   const [csvPreview, setCsvPreview] = useState<Record<string, string>[]>([]);
-  const [csvText, setCsvText] = useState<string>("");
+  const [csvText, setCsvText] = useState("");
   const [generatedRows, setGeneratedRows] = useState<Record<string, string>[]>([]);
   const [isParsing, setIsParsing] = useState(false);
   const [storedMapping, setStoredMapping] = useState<MappingConfig | null>(null);
   const [hasUserMapping, setHasUserMapping] = useState(false);
   const [outlookDirectory, setOutlookDirectory] = useState<OutlookDirectory | null>(null);
   const [emailOverrides, setEmailOverrides] = useState<Record<string, string>>({});
-  const [pendingBulkAction, setPendingBulkAction] = useState<
-    null | "secondName" | "correlative"
-  >(null);
+  const [pendingBulkAction, setPendingBulkAction] = useState<null | "secondName" | "correlative">(null);
 
   useEffect(() => {
     const rawMapping = localStorage.getItem(STORAGE_MAPPING);
@@ -417,15 +217,13 @@ export default function HomePage() {
 
   useEffect(() => {
     if (workbook && sheetName) {
-      const sheet =
-        workbook.sheets.find((item) => item.name === sheetName) ??
-        workbook.sheets[0];
+      const sheet = workbook.sheets.find((item) => item.name === sheetName) ?? workbook.sheets[0];
       setColumns(sheet?.columns ?? []);
       setRows(sheet?.rows ?? []);
-    } else {
-      setColumns([]);
-      setRows([]);
+      return;
     }
+    setColumns([]);
+    setRows([]);
   }, [workbook, sheetName]);
 
   useEffect(() => {
@@ -449,37 +247,51 @@ export default function HomePage() {
     localStorage.setItem(STORAGE_REQUIRED, JSON.stringify(required));
   }, [required]);
 
-  const conditionColumn = useMemo(
-    () => findColumn(columns, ["CONDICION", "CONDICIÓN"]),
-    [columns]
-  );
+  const conditionColumn = useMemo(() => findBestColumn(columns, ["CONDICION"]), [columns]);
   const existingEmails = outlookDirectory?.emails ?? EMPTY_SET;
   const emailByDni = outlookDirectory?.emailByDni ?? EMPTY_DIRECTORY_MAP;
   const emailByCode = outlookDirectory?.emailByCode ?? EMPTY_DIRECTORY_MAP;
 
   const validationIssues = useMemo(
-    () => validateRows(rows, mapping, required, conditionColumn, emailByDni, emailByCode),
+    () =>
+      validateRows(
+        rows,
+        mapping,
+        required,
+        conditionColumn,
+        MOBILE_HEADER,
+        POSTAL_HEADER,
+        emailByDni,
+        emailByCode,
+        getGeneratedEmail
+      ),
     [rows, mapping, required, conditionColumn, emailByDni, emailByCode]
   );
+
   const baseExportRows = useMemo(
-    () => filterRowsForExport(rows, mapping, required, conditionColumn, emailByDni, emailByCode),
+    () =>
+      filterRowsForExport(
+        rows,
+        mapping,
+        required,
+        conditionColumn,
+        MOBILE_HEADER,
+        POSTAL_HEADER,
+        emailByDni,
+        emailByCode,
+        getGeneratedEmail
+      ),
     [rows, mapping, required, conditionColumn, emailByDni, emailByCode]
   );
-  const totalCsvParts = useMemo(() => {
-    if (!generatedRows.length) {
-      return 0;
-    }
-    return Math.ceil(generatedRows.length / 249);
-  }, [generatedRows.length]);
+
   const existingStudentMatches = useMemo(() => {
     if (!emailByDni.size && !emailByCode.size) {
       return [] as ExistingStudentMatch[];
     }
     return rows
-      .filter((row) => rowHasIngresoCondition(row, conditionColumn))
       .map((row) => {
         const output = buildOutputRow(row, mapping);
-        const existingStudent = findExistingStudent(output, emailByDni, emailByCode);
+        const existingStudent = findExistingStudent(output, POSTAL_HEADER, emailByDni, emailByCode);
         if (!existingStudent) {
           return null;
         }
@@ -494,7 +306,8 @@ export default function HomePage() {
         };
       })
       .filter(Boolean) as ExistingStudentMatch[];
-  }, [rows, mapping, conditionColumn, emailByDni, emailByCode]);
+  }, [rows, mapping, emailByDni, emailByCode]);
+
   const emailConflictRows = useMemo(() => {
     if (!existingEmails.size) {
       return [] as EmailConflictRow[];
@@ -506,29 +319,29 @@ export default function HomePage() {
           return null;
         }
         const { nombre, apellido } = getRowNameParts(row, mapping);
-        return {
-          rowNumber: row.__rowNumber,
-          row,
-          nombre,
-          apellido,
-          generatedEmail
-        };
+        return { rowNumber: row.__rowNumber, row, nombre, apellido, generatedEmail };
       })
       .filter(Boolean) as EmailConflictRow[];
   }, [baseExportRows, mapping, existingEmails]);
-  const plannedEmailCounts = useMemo(() => {
-    const counts = new Map<string, number>();
-    baseExportRows.forEach((row) => {
-      const key = String(row.__rowNumber);
-      const override = emailOverrides[key];
-      const email = normalizeEmail(override || getGeneratedEmail(row, mapping));
-      if (!email) {
-        return;
-      }
-      counts.set(email, (counts.get(email) ?? 0) + 1);
-    });
-    return counts;
-  }, [baseExportRows, emailOverrides, mapping]);
+
+  const plannedEmailCounts = useMemo(
+    () => buildPlannedEmailCounts(baseExportRows, mapping, emailOverrides, getGeneratedEmail),
+    [baseExportRows, mapping, emailOverrides]
+  );
+
+  const internalDuplicateRows = useMemo(
+    () =>
+      findInternalDuplicateRows(
+        baseExportRows,
+        mapping,
+        emailOverrides,
+        existingEmails,
+        plannedEmailCounts,
+        getGeneratedEmail
+      ),
+    [baseExportRows, mapping, emailOverrides, existingEmails, plannedEmailCounts]
+  );
+
   const exportRows = useMemo(
     () =>
       filterRowsByEmail(
@@ -536,18 +349,20 @@ export default function HomePage() {
         mapping,
         emailOverrides,
         existingEmails,
-        plannedEmailCounts
+        plannedEmailCounts,
+        getGeneratedEmail
       ),
     [baseExportRows, mapping, emailOverrides, existingEmails, plannedEmailCounts]
   );
+
+  const totalCsvParts = useMemo(() => (generatedRows.length ? Math.ceil(generatedRows.length / 249) : 0), [generatedRows.length]);
 
   const buildUsedEmailSet = (overrides: Record<string, string>) => {
     const used = new Set<string>();
     existingEmails.forEach((email) => used.add(email));
     baseExportRows.forEach((row) => {
       const key = String(row.__rowNumber);
-      const override = overrides[key];
-      const email = normalizeEmail(override || getGeneratedEmail(row, mapping));
+      const email = normalizeEmail(overrides[key] || getGeneratedEmail(row, mapping));
       if (email) {
         used.add(email);
       }
@@ -559,15 +374,11 @@ export default function HomePage() {
     setEmailOverrides(() => {
       const updated: Record<string, string> = {};
       emailConflictRows.forEach((conflict) => {
-        const key = String(conflict.rowNumber);
         const alternate = getAlternateEmail(conflict.row, mapping);
-        if (!alternate) {
+        if (!alternate || normalizeEmail(alternate) === conflict.generatedEmail) {
           return;
         }
-        if (normalizeEmail(alternate) === conflict.generatedEmail) {
-          return;
-        }
-        updated[key] = alternate;
+        updated[String(conflict.rowNumber)] = alternate;
       });
       return updated;
     });
@@ -578,12 +389,11 @@ export default function HomePage() {
       const updated: Record<string, string> = {};
       const used = buildUsedEmailSet(updated);
       emailConflictRows.forEach((conflict) => {
-        const key = String(conflict.rowNumber);
         const candidate = buildCorrelativeEmail(conflict.generatedEmail, used);
         if (!candidate) {
           return;
         }
-        updated[key] = candidate;
+        updated[String(conflict.rowNumber)] = candidate;
         used.add(normalizeEmail(candidate));
       });
       return updated;
@@ -602,8 +412,7 @@ export default function HomePage() {
     setEmailOverrides({});
     setGeneratedRows([]);
     try {
-      const buffer = await file.arrayBuffer();
-      const parsed = parseWorkbook(buffer);
+      const parsed = parseWorkbook(await file.arrayBuffer());
       setWorkbook(parsed);
       setSheetName(parsed.sheets[0]?.name ?? "");
     } finally {
@@ -617,70 +426,13 @@ export default function HomePage() {
       return;
     }
     try {
-      const text = await file.text();
-      const parsed = Papa.parse<Record<string, string>>(text, {
+      const parsed = Papa.parse<Record<string, string>>(await file.text(), {
         header: true,
         skipEmptyLines: true
       });
-      const fields = parsed.meta.fields ?? [];
-      const faxField = findColumn(fields, ["Fax", "FAX"]);
-      const postalField = findColumn(fields, [
-        "Postal code",
-        "PostalCode",
-        "Codigo postal",
-        "Codigo estudiante"
-      ]);
-      const upnField = findColumn(fields, [
-        "User principal name",
-        "UserPrincipalName",
-        "User principalname"
-      ]);
-
-      if (!upnField || (!faxField && !postalField)) {
-        setOutlookDirectory({
-          fileName: file.name,
-          rowCount: parsed.data.length,
-          emails: new Set(),
-          emailByDni: new Map(),
-          emailByCode: new Map(),
-          error:
-            "No se encontraron User principal name y al menos una columna de cruce (Fax o Postal code) en el CSV."
-        });
-        return;
-      }
-
-      const emails = new Set<string>();
-      const emailByDni = new Map<string, string>();
-      const emailByCode = new Map<string, string>();
-      parsed.data.forEach((row) => {
-        const email = normalizeEmail(row[upnField] ?? "");
-        if (email) {
-          emails.add(email);
-        }
-        if (!email) {
-          return;
-        }
-        if (faxField) {
-          const dni = digitsOnly(toCleanString(row[faxField] ?? ""));
-          if (dni && !emailByDni.has(dni)) {
-            emailByDni.set(dni, email);
-          }
-        }
-        if (postalField) {
-          const codigo = normalizeStudentCode(row[postalField] ?? "");
-          if (codigo && !emailByCode.has(codigo)) {
-            emailByCode.set(codigo, email);
-          }
-        }
-      });
-
       setOutlookDirectory({
         fileName: file.name,
-        rowCount: parsed.data.length,
-        emails,
-        emailByDni,
-        emailByCode,
-        error: null
+        ...buildOutlookDirectoryData(parsed.data, parsed.meta.fields ?? [])
       });
     } catch {
       setOutlookDirectory({
@@ -689,6 +441,7 @@ export default function HomePage() {
         emails: new Set(),
         emailByDni: new Map(),
         emailByCode: new Map(),
+        inconsistencies: [],
         error: "No se pudo leer el CSV de Outlook."
       });
     }
@@ -696,8 +449,7 @@ export default function HomePage() {
 
   const buildCurrentOutputRows = () =>
     buildOutputRows(exportRows, mapping).map((row, index) => {
-      const sourceRow = exportRows[index];
-      const key = String(sourceRow.__rowNumber);
+      const key = String(exportRows[index].__rowNumber);
       const override = emailOverrides[key];
       if (override && toCleanString(override)) {
         row["Nombre de usuario"] = normalizeEmail(override);
@@ -714,10 +466,7 @@ export default function HomePage() {
         fields: OUTLOOK_HEADERS,
         data: outputRows.map((row) => OUTLOOK_HEADERS.map((header) => row[header] ?? ""))
       },
-      {
-        delimiter: ",",
-        newline: "\r\n"
-      }
+      { delimiter: ",", newline: "\r\n" }
     );
     setCsvText(`\ufeff${csvBody}`);
   };
@@ -729,29 +478,20 @@ export default function HomePage() {
     }
     const chunkSize = 249;
     const totalParts = Math.ceil(outputRows.length / chunkSize);
-
     for (let index = 0; index < totalParts; index += 1) {
-      const start = index * chunkSize;
-      const chunk = outputRows.slice(start, start + chunkSize);
+      const chunk = outputRows.slice(index * chunkSize, index * chunkSize + chunkSize);
       const csvBody = Papa.unparse(
         {
           fields: OUTLOOK_HEADERS,
           data: chunk.map((row) => OUTLOOK_HEADERS.map((header) => row[header] ?? ""))
         },
-        {
-          delimiter: ",",
-          newline: "\r\n"
-        }
+        { delimiter: ",", newline: "\r\n" }
       );
-      const csvTextChunk = `\ufeff${csvBody}`;
-      const blob = new Blob([csvTextChunk], { type: "text/csv;charset=utf-8" });
+      const blob = new Blob([`\ufeff${csvBody}`], { type: "text/csv;charset=utf-8" });
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = url;
-      anchor.download =
-        totalParts === 1
-          ? "contactos_outlook.csv"
-          : `contactos_outlook_parte_${index + 1}.csv`;
+      anchor.download = totalParts === 1 ? "contactos_outlook.csv" : `contactos_outlook_parte_${index + 1}.csv`;
       window.setTimeout(() => {
         anchor.click();
         URL.revokeObjectURL(url);
@@ -759,61 +499,81 @@ export default function HomePage() {
     }
   };
 
+  const handleDownloadInconsistencies = () => {
+    if (!outlookDirectory?.inconsistencies.length) {
+      return;
+    }
+
+    const csvBody = Papa.unparse(
+      {
+        fields: ["Tipo", "Valor", "Correos"],
+        data: outlookDirectory.inconsistencies.map((conflict) => [
+          formatConflictKind(conflict.kind),
+          conflict.value,
+          conflict.emails.join(", ")
+        ])
+      },
+      {
+        delimiter: ",",
+        newline: "\r\n"
+      }
+    );
+
+    const blob = new Blob([`\ufeff${csvBody}`], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "inconsistencias_outlook.csv";
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
+
   const handleReset = () => {
-    const defaults = buildDefaultMapping(columns);
-    setMapping(defaults);
+    setMapping(buildDefaultMapping(columns));
     setRequired(DEFAULT_REQUIRED);
     setHasUserMapping(true);
   };
 
   return (
     <main className="px-4 py-10">
-      <div className="mx-auto flex max-w-6xl flex-col gap-10">
+      <div className="mx-auto max-w-6xl space-y-8">
         <header className="space-y-3">
           <span className="inline-flex w-fit items-center rounded-full border border-ink/15 bg-white/60 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] text-ink/70">
-            Outlook CSV - UAI
+            UAI
           </span>
-          <h1 className="text-3xl font-semibold text-ink sm:text-4xl">
-            Generador de contactos para Outlook
-          </h1>
-          <p className="max-w-2xl text-base text-ink/75">
-            Carga un Excel, configura el mapeo y descarga un CSV listo para importar
-            en Outlook (español).
-          </p>
+          <div>
+            <h1 className="text-3xl font-semibold text-ink">Generador de contactos para Outlook</h1>
+            <p className="mt-2 max-w-3xl text-sm text-ink/70">
+              Carga un Excel, configura el mapeo y descarga un CSV listo para importar.
+            </p>
+          </div>
         </header>
 
         <section className="rounded-3xl border border-white/60 bg-white/70 p-6 shadow-sm">
           <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
             <div>
               <h2 className="text-xl font-semibold text-ink">1. Cargar XLSX</h2>
-              <p className="text-sm text-ink/70">
-                Selecciona el archivo de informe con datos de estudiantes.
-              </p>
+              <p className="text-sm text-ink/70">Selecciona el archivo de informe con datos de estudiantes.</p>
             </div>
             <label className="inline-flex cursor-pointer items-center gap-2 rounded-full border border-ink/20 bg-white px-4 py-2 text-sm font-semibold text-ink transition hover:border-ink/40">
-              <input
-                type="file"
-                accept=".xlsx"
-                className="hidden"
-                onChange={handleFileChange}
-              />
+              <input type="file" accept=".xlsx" onChange={handleFileChange} className="hidden" />
               Subir XLSX
             </label>
           </div>
 
           {isParsing && (
             <div className="mt-4 rounded-2xl border border-ink/10 bg-sand/70 px-4 py-3 text-sm text-ink/70">
-              Procesando archivo...
+              Leyendo archivo...
             </div>
           )}
 
           {workbook && workbook.sheets.length > 1 && (
-            <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-center">
-              <span className="text-sm font-semibold text-ink">Hoja:</span>
+            <div className="mt-6">
+              <label className="text-sm font-semibold text-ink">Hoja</label>
               <select
                 value={sheetName}
                 onChange={(event) => setSheetName(event.target.value)}
-                className="rounded-xl border border-ink/20 bg-white px-3 py-2 text-sm"
+                className="mt-2 rounded-xl border border-ink/20 bg-white px-3 py-2 text-sm"
               >
                 {workbook.sheets.map((sheet) => (
                   <option key={sheet.name} value={sheet.name}>
@@ -838,7 +598,7 @@ export default function HomePage() {
 
         <section className="rounded-3xl border border-white/60 bg-white/70 p-6 shadow-sm">
           <MappingEditor
-            outlookHeaders={OUTLOOK_HEADERS}
+            mappingHeaders={MAPPING_HEADERS}
             columns={columns}
             mapping={mapping}
             onChange={(next) => {
@@ -854,17 +614,12 @@ export default function HomePage() {
             <div>
               <h2 className="text-xl font-semibold text-ink">2. Validar con CSV de Outlook</h2>
               <p className="text-sm text-ink/70">
-                Sube el CSV exportado de Outlook para detectar alumnos con correo por DNI o codigo y correos ya usados.
+                Sube el CSV exportado de Outlook para detectar alumnos con correo por DNI o código y correos ya usados.
               </p>
             </div>
             <label className="inline-flex cursor-pointer items-center gap-2 rounded-full border border-ink/20 bg-white px-4 py-2 text-sm font-semibold text-ink transition hover:border-ink/40">
-              <input
-                type="file"
-                accept=".csv"
-                className="hidden"
-                onChange={handleOutlookCsvChange}
-              />
-              Subir CSV Outlook
+              <input type="file" accept=".csv" onChange={handleOutlookCsvChange} className="hidden" />
+              Subir CSV de Outlook
             </label>
           </div>
 
@@ -880,8 +635,9 @@ export default function HomePage() {
                 <div>Archivo: {outlookDirectory.fileName}</div>
                 <div>Registros leídos: {outlookDirectory.rowCount}</div>
                 <div>DNI con correo detectados: {outlookDirectory.emailByDni.size}</div>
-                <div>Codigos con correo detectados: {outlookDirectory.emailByCode.size}</div>
+                <div>Códigos con correo detectados: {outlookDirectory.emailByCode.size}</div>
                 <div>Correos detectados: {outlookDirectory.emails.size}</div>
+                <div>Conflictos internos del directorio: {outlookDirectory.inconsistencies.length}</div>
               </div>
               {outlookDirectory.error && (
                 <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
@@ -894,11 +650,57 @@ export default function HomePage() {
           {outlookDirectory && !outlookDirectory.error && (
             <div className="mt-6 space-y-6">
               <div>
-                <h3 className="text-base font-semibold text-ink">
-                  Estudiantes con correo existente
-                </h3>
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <h3 className="text-base font-semibold text-ink">Inconsistencias en el CSV de Outlook</h3>
+                    <p className="text-sm text-ink/70">
+                      Se muestran identificadores repetidos con correos distintos dentro del mismo CSV.
+                    </p>
+                  </div>
+                  {outlookDirectory.inconsistencies.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={handleDownloadInconsistencies}
+                      className="rounded-full border border-ink/20 bg-white/80 px-4 py-2 text-sm font-semibold text-ink transition hover:border-ink/40"
+                    >
+                      Exportar inconsistencias
+                    </button>
+                  )}
+                </div>
+                <div className="mt-3">
+                  {outlookDirectory.inconsistencies.length === 0 ? (
+                    <div className="rounded-2xl border border-ink/10 bg-white/70 px-4 py-3 text-sm text-ink/70">
+                      No se detectaron inconsistencias por DNI o código.
+                    </div>
+                  ) : (
+                    <div className="overflow-x-auto rounded-2xl border border-white/60 bg-white/70">
+                      <table className="min-w-full text-sm">
+                        <thead className="bg-sand/80 text-left">
+                          <tr>
+                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Tipo</th>
+                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Valor</th>
+                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Correos</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {outlookDirectory.inconsistencies.map((conflict) => (
+                            <tr key={`${conflict.kind}-${conflict.value}`} className="border-t border-white/60">
+                              <td className="px-4 py-2 text-ink/90">{formatConflictKind(conflict.kind)}</td>
+                              <td className="px-4 py-2 text-ink/90">{conflict.value}</td>
+                              <td className="px-4 py-2 text-ink/90">{conflict.emails.join(", ")}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div>
+                <h3 className="text-base font-semibold text-ink">Estudiantes con correo existente</h3>
                 <p className="text-sm text-ink/70">
-                  Estas filas no se mostraran como exportables ni se incluiran en el CSV final.
+                  Estas filas no se mostrarán como exportables ni se incluirán en el CSV final.
                 </p>
                 <div className="mt-3">
                   {existingStudentMatches.length === 0 ? (
@@ -910,27 +712,13 @@ export default function HomePage() {
                       <table className="min-w-full text-sm">
                         <thead className="bg-sand/80 text-left">
                           <tr>
-                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">
-                              Fila
-                            </th>
-                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">
-                              DNI
-                            </th>
-                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">
-                              Codigo estudiante
-                            </th>
-                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">
-                              Apellido
-                            </th>
-                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">
-                              Nombre
-                            </th>
-                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">
-                              Coincidencia
-                            </th>
-                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">
-                              Correo existente
-                            </th>
+                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Fila</th>
+                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">DNI</th>
+                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Código estudiante</th>
+                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Apellido</th>
+                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Nombre</th>
+                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Coincidencia</th>
+                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Correo existente</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -942,9 +730,7 @@ export default function HomePage() {
                               <td className="px-4 py-2 text-ink/90">{match.apellido || "-"}</td>
                               <td className="px-4 py-2 text-ink/90">{match.nombre || "-"}</td>
                               <td className="px-4 py-2 text-ink/90">{match.matchReason}</td>
-                              <td className="px-4 py-2 text-ink/90">
-                                {match.existingEmail || "-"}
-                              </td>
+                              <td className="px-4 py-2 text-ink/90">{match.existingEmail || "-"}</td>
                             </tr>
                           ))}
                         </tbody>
@@ -964,6 +750,20 @@ export default function HomePage() {
                   </div>
                   {emailConflictRows.length > 0 && (
                     <div className="flex flex-wrap gap-3">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const hasChanges = Object.keys(emailOverrides).length > 0;
+                          if (hasChanges) {
+                            setPendingBulkAction("secondName");
+                            return;
+                          }
+                          applySecondNameOverrides();
+                        }}
+                        className="rounded-full border border-ink/20 bg-white/80 px-4 py-2 text-sm font-semibold text-ink transition hover:border-ink/40"
+                      >
+                        Usar segundo nombre
+                      </button>
                       <button
                         type="button"
                         onClick={() => {
@@ -991,72 +791,43 @@ export default function HomePage() {
                       <table className="min-w-full text-sm">
                         <thead className="bg-sand/80 text-left">
                           <tr>
-                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">
-                              Fila
-                            </th>
-                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">
-                              Apellido
-                            </th>
-                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">
-                              Nombre
-                            </th>
-                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">
-                              Generado
-                            </th>
-                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">
-                              Correo final
-                            </th>
-                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">
-                              Estado
-                            </th>
+                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Fila</th>
+                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Apellido</th>
+                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Nombre</th>
+                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Generado</th>
+                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Correo final</th>
+                            <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Estado</th>
                           </tr>
                         </thead>
                         <tbody>
                           {emailConflictRows.map((conflict) => {
                             const key = String(conflict.rowNumber);
-                            const currentValue =
-                              emailOverrides[key] ?? conflict.generatedEmail;
+                            const currentValue = emailOverrides[key] ?? conflict.generatedEmail;
                             const normalized = normalizeEmail(currentValue);
-                            const isUsed = normalized
-                              ? existingEmails.has(normalized)
-                              : false;
-                            const isDuplicate = normalized
-                              ? (plannedEmailCounts.get(normalized) ?? 0) > 1
-                              : false;
+                            const isUsed = normalized ? existingEmails.has(normalized) : false;
+                            const isDuplicate = normalized ? (plannedEmailCounts.get(normalized) ?? 0) > 1 : false;
                             const status = !normalized
                               ? "Sin correo"
                               : isUsed
                               ? "En uso"
                               : isDuplicate
-                              ? "Duplicado en la lista (no se exporta)"
+                              ? "Duplicado en la lista"
                               : "Disponible";
 
                             return (
                               <tr key={conflict.rowNumber} className="border-t border-white/60">
-                                <td className="px-4 py-2 text-ink/90">
-                                  {conflict.rowNumber}
-                                </td>
-                                <td className="px-4 py-2 text-ink/90">
-                                  {conflict.apellido || "-"}
-                                </td>
-                                <td className="px-4 py-2 text-ink/90">
-                                  {conflict.nombre || "-"}
-                                </td>
-                                <td className="px-4 py-2 text-ink/70">
-                                  {conflict.generatedEmail}
-                                </td>
+                                <td className="px-4 py-2 text-ink/90">{conflict.rowNumber}</td>
+                                <td className="px-4 py-2 text-ink/90">{conflict.apellido || "-"}</td>
+                                <td className="px-4 py-2 text-ink/90">{conflict.nombre || "-"}</td>
+                                <td className="px-4 py-2 text-ink/70">{conflict.generatedEmail}</td>
                                 <td className="px-4 py-2">
                                   <input
                                     value={currentValue}
                                     onChange={(event) => {
-                                      const nextValue = event.target.value;
-                                      const cleanedValue = toCleanString(nextValue);
+                                      const cleanedValue = toCleanString(event.target.value);
                                       setEmailOverrides((prev) => {
                                         const updated = { ...prev };
-                                        if (
-                                          !cleanedValue ||
-                                          normalizeEmail(cleanedValue) === conflict.generatedEmail
-                                        ) {
+                                        if (!cleanedValue || normalizeEmail(cleanedValue) === conflict.generatedEmail) {
                                           delete updated[key];
                                         } else {
                                           updated[key] = cleanedValue;
@@ -1084,19 +855,15 @@ export default function HomePage() {
         <section className="rounded-3xl border border-white/60 bg-white/70 p-6 shadow-sm">
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <div>
-              <h2 className="text-xl font-semibold text-ink">Validaciones y errores</h2>
-              <p className="text-sm text-ink/70">
-                Define que campos son obligatorios y revisa filas con faltantes.
-              </p>
+              <h2 className="text-xl font-semibold text-ink">3. Validaciones y errores</h2>
+              <p className="text-sm text-ink/70">Define qué campos son obligatorios y revisa filas con faltantes.</p>
             </div>
             <div className="flex flex-wrap gap-3 text-sm text-ink/80">
               <label className="flex items-center gap-2 rounded-full border border-ink/10 bg-white/70 px-3 py-1">
                 <input
                   type="checkbox"
                   checked={required.dni}
-                  onChange={(event) =>
-                    setRequired((prev) => ({ ...prev, dni: event.target.checked }))
-                  }
+                  onChange={(event) => setRequired((prev) => ({ ...prev, dni: event.target.checked }))}
                 />
                 DNI
               </label>
@@ -1104,9 +871,7 @@ export default function HomePage() {
                 <input
                   type="checkbox"
                   checked={required.celular}
-                  onChange={(event) =>
-                    setRequired((prev) => ({ ...prev, celular: event.target.checked }))
-                  }
+                  onChange={(event) => setRequired((prev) => ({ ...prev, celular: event.target.checked }))}
                 />
                 Celular
               </label>
@@ -1114,9 +879,7 @@ export default function HomePage() {
                 <input
                   type="checkbox"
                   checked={required.codigo}
-                  onChange={(event) =>
-                    setRequired((prev) => ({ ...prev, codigo: event.target.checked }))
-                  }
+                  onChange={(event) => setRequired((prev) => ({ ...prev, codigo: event.target.checked }))}
                 />
                 Código estudiante
               </label>
@@ -1126,7 +889,7 @@ export default function HomePage() {
           <div className="mt-4 rounded-2xl border border-ink/10 bg-sand/70 px-4 py-3 text-sm text-ink/70">
             {validationIssues.length === 0
               ? "No hay filas con problemas según las reglas actuales."
-              : `${validationIssues.length} filas con datos incompletos.`}
+              : `${validationIssues.length} filas con datos incompletos o sin correo institucional.`}
           </div>
 
           {validationIssues.length > 0 && (
@@ -1134,38 +897,69 @@ export default function HomePage() {
               <table className="min-w-full text-sm">
                 <thead className="bg-sand/80 text-left">
                   <tr>
-                    <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">
-                      Fila
-                    </th>
-                    <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">
-                      Faltantes
-                    </th>
+                    <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Fila</th>
+                    <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Problemas</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {validationIssues.map((issue) => (
+                  {validationIssues.map((issue: ValidationIssue) => (
                     <tr key={issue.rowNumber} className="border-t border-white/60">
                       <td className="px-4 py-2 text-ink/90">{issue.rowNumber}</td>
-                      <td className="px-4 py-2 text-ink/90">
-                        {issue.missing.join(", ")}
-                      </td>
+                      <td className="px-4 py-2 text-ink/90">{issue.issues.join(", ")}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
           )}
+
+          <div className="mt-6">
+            <h3 className="text-base font-semibold text-ink">Duplicados internos</h3>
+            <p className="text-sm text-ink/70">
+              Estas filas compiten por el mismo correo final dentro de la exportación.
+            </p>
+            <div className="mt-3">
+              {internalDuplicateRows.length === 0 ? (
+                <div className="rounded-2xl border border-ink/10 bg-white/70 px-4 py-3 text-sm text-ink/70">
+                  No hay duplicados internos de correo.
+                </div>
+              ) : (
+                <div className="overflow-x-auto rounded-2xl border border-white/60 bg-white/70">
+                  <table className="min-w-full text-sm">
+                    <thead className="bg-sand/80 text-left">
+                      <tr>
+                        <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Fila</th>
+                        <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Apellido</th>
+                        <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Nombre</th>
+                        <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Generado</th>
+                        <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink/70">Correo final duplicado</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {internalDuplicateRows.map((duplicate: InternalDuplicateRow) => (
+                        <tr key={`${duplicate.rowNumber}-${duplicate.finalEmail}`} className="border-t border-white/60">
+                          <td className="px-4 py-2 text-ink/90">{duplicate.rowNumber}</td>
+                          <td className="px-4 py-2 text-ink/90">{duplicate.apellido || "-"}</td>
+                          <td className="px-4 py-2 text-ink/90">{duplicate.nombre || "-"}</td>
+                          <td className="px-4 py-2 text-ink/70">{duplicate.generatedEmail || "-"}</td>
+                          <td className="px-4 py-2 text-ink/90">{duplicate.finalEmail}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </div>
         </section>
 
         <section className="rounded-3xl border border-white/60 bg-white/70 p-6 shadow-sm">
           <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
             <div>
-              <h2 className="text-xl font-semibold text-ink">Generar CSV</h2>
+              <h2 className="text-xl font-semibold text-ink">4. Generar CSV</h2>
+              <p className="text-sm text-ink/70">Genera el CSV con el orden exacto de Outlook y revisa el preview.</p>
               <p className="text-sm text-ink/70">
-                Genera el CSV con el orden exacto de Outlook y revisa el preview.
-              </p>
-              <p className="text-sm text-ink/70">
-                Filas exportables: {exportRows.length} de {rows.length} segun condicion INGRESO, campos obligatorios, sin alumnos con correo existente por DNI o codigo, sin correos ya usados y sin duplicados internos.
+                Filas exportables: {exportRows.length} de {rows.length} según condición INGRESO, campos obligatorios, sin alumnos con correo existente por DNI o código, sin correos ya usados, sin correo vacío y sin duplicados internos.
               </p>
               {totalCsvParts > 0 && (
                 <p className="text-sm text-ink/70">
@@ -1212,8 +1006,8 @@ export default function HomePage() {
               <div>
                 <h4 className="text-lg font-semibold text-ink">Cambiar sugerencias</h4>
                 <p className="mt-2 text-sm text-ink/70">
-                  Estas a punto de reemplazar todos los correos editados por nuevas
-                  sugerencias. Si quieres conservar tus cambios, puedes cancelar.
+                  Estás a punto de reemplazar todos los correos editados por nuevas sugerencias.
+                  Si quieres conservar tus cambios, puedes cancelar.
                 </p>
               </div>
               <button
@@ -1238,7 +1032,7 @@ export default function HomePage() {
                 onClick={() => {
                   if (pendingBulkAction === "secondName") {
                     applySecondNameOverrides();
-                  } else if (pendingBulkAction === "correlative") {
+                  } else {
                     applyCorrelativeOverrides();
                   }
                   setPendingBulkAction(null);

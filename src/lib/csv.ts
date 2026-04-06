@@ -4,9 +4,9 @@ import {
   buildUsernameWithSecondName,
   digitsOnly,
   getLeadingWord,
-  stripAccents,
   toCleanString
 } from "./normalization";
+import { normalizeLookupKey } from "./matching";
 import type { DataRow } from "./xlsx";
 
 export const OUTLOOK_HEADERS = [
@@ -16,17 +16,27 @@ export const OUTLOOK_HEADERS = [
   "Nombre para mostrar",
   "Puesto",
   "Departamento",
-  "Número del trabajo",
-  "Teléfono de la oficina",
-  "Teléfono móvil",
+  "N\u00famero del trabajo",
+  "Tel\u00e9fono de la oficina",
+  "Tel\u00e9fono m\u00f3vil",
   "Fax",
-  "Dirección de correo electrónico alternativa",
-  "Dirección",
+  "Direcci\u00f3n de correo electr\u00f3nico alternativa",
+  "Direcci\u00f3n",
   "Ciudad",
   "Estado o provincia",
-  "Código postal",
-  "País o región"
+  "C\u00f3digo postal",
+  "Pa\u00eds o regi\u00f3n"
 ];
+
+export const PATERNAL_SURNAME_HEADER = "Apellido paterno";
+export const MATERNAL_SURNAME_HEADER = "Apellido materno";
+export const EXTRA_MAPPING_HEADERS = [
+  PATERNAL_SURNAME_HEADER,
+  MATERNAL_SURNAME_HEADER
+];
+export const MAPPING_HEADERS = OUTLOOK_HEADERS.flatMap((header) =>
+  header === "Nombre" ? [header, ...EXTRA_MAPPING_HEADERS] : [header]
+);
 
 export type MappingRule = {
   type: "column" | "fixed" | "generated";
@@ -69,7 +79,7 @@ function resolveBaseValue(
 }
 
 function normalizeSourceKey(value: string): string {
-  return stripAccents(value).toUpperCase().replace(/[^A-Z0-9]/g, "");
+  return normalizeLookupKey(value);
 }
 
 function findStructuredValue(row: DataRow, candidates: string[]): string {
@@ -100,13 +110,32 @@ function findStructuredValue(row: DataRow, candidates: string[]): string {
   return "";
 }
 
-function getStructuredSurnames(row: DataRow): {
+function resolveStructuredValue(
+  row: DataRow,
+  mapping: MappingConfig,
+  mappingHeader: string,
+  candidates: string[]
+): string {
+  return resolveBaseValue(mapping[mappingHeader], row) || findStructuredValue(row, candidates);
+}
+
+function getStructuredSurnames(row: DataRow, mapping: MappingConfig): {
   paterno: string;
   materno: string;
   completo: string;
 } {
-  const paterno = findStructuredValue(row, STRUCTURED_PATERNAL_COLUMNS);
-  const materno = findStructuredValue(row, STRUCTURED_MATERNAL_COLUMNS);
+  const paterno = resolveStructuredValue(
+    row,
+    mapping,
+    PATERNAL_SURNAME_HEADER,
+    STRUCTURED_PATERNAL_COLUMNS
+  );
+  const materno = resolveStructuredValue(
+    row,
+    mapping,
+    MATERNAL_SURNAME_HEADER,
+    STRUCTURED_MATERNAL_COLUMNS
+  );
   return {
     paterno,
     materno,
@@ -116,7 +145,11 @@ function getStructuredSurnames(row: DataRow): {
 
 function resolveSurnameValue(row: DataRow, mapping: MappingConfig): string {
   const rule = mapping["Apellido"];
-  const structured = getStructuredSurnames(row);
+  const structured = getStructuredSurnames(row, mapping);
+
+  if (structured.completo) {
+    return structured.completo;
+  }
 
   if (rule?.type === "generated" && rule.value === GENERATED_FULL_SURNAME) {
     return structured.completo;
@@ -126,7 +159,7 @@ function resolveSurnameValue(row: DataRow, mapping: MappingConfig): string {
 }
 
 function resolveUsernameSurname(row: DataRow, mapping: MappingConfig): string {
-  const structured = getStructuredSurnames(row);
+  const structured = getStructuredSurnames(row, mapping);
   if (structured.paterno) {
     return structured.paterno;
   }

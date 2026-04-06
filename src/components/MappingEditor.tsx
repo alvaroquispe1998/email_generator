@@ -1,7 +1,12 @@
-import type { MappingConfig, MappingRule } from "@/lib/csv";
+import {
+  MATERNAL_SURNAME_HEADER,
+  PATERNAL_SURNAME_HEADER,
+  type MappingConfig,
+  type MappingRule
+} from "@/lib/csv";
 
 type MappingEditorProps = {
-  outlookHeaders: string[];
+  mappingHeaders: string[];
   columns: string[];
   mapping: MappingConfig;
   onChange: (next: MappingConfig) => void;
@@ -27,15 +32,30 @@ function getRule(mapping: MappingConfig, header: string): MappingRule {
   return mapping[header] ?? { type: "fixed", value: "" };
 }
 
+function hasValue(rule: MappingRule | undefined): boolean {
+  return Boolean(rule && rule.value.trim());
+}
+
 export function MappingEditor({
-  outlookHeaders,
+  mappingHeaders,
   columns,
   mapping,
   onChange,
   onReset
 }: MappingEditorProps) {
   const updateRule = (header: string, rule: MappingRule) => {
-    onChange({ ...mapping, [header]: rule });
+    const next = { ...mapping, [header]: rule };
+    if (
+      header === PATERNAL_SURNAME_HEADER ||
+      header === MATERNAL_SURNAME_HEADER
+    ) {
+      const hasStructuredSurnames =
+        hasValue(next[PATERNAL_SURNAME_HEADER]) || hasValue(next[MATERNAL_SURNAME_HEADER]);
+      if (hasStructuredSurnames) {
+        next.Apellido = { type: "generated", value: "fullSurname" };
+      }
+    }
+    onChange(next);
   };
 
   return (
@@ -57,7 +77,7 @@ export function MappingEditor({
       </div>
 
       <div className="grid gap-3">
-        {outlookHeaders.map((header) => {
+        {mappingHeaders.map((header) => {
           const rule = getRule(mapping, header);
           const generated = GENERATED_LABELS[header];
           const canGenerate = Boolean(generated);

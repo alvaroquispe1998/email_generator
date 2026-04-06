@@ -2,6 +2,10 @@
 
 Aplicacion web para convertir un XLSX con datos de estudiantes en un CSV compatible con importacion de contactos en Outlook.
 
+Documentacion detallada del flujo:
+
+- `docs/FUNCIONAMIENTO.md`
+
 ## Instalacion
 
 ```bash
@@ -12,6 +16,12 @@ npm install
 
 ```bash
 npm run dev
+```
+
+## Pruebas
+
+```bash
+npm test
 ```
 
 ## Uso rapido
@@ -27,6 +37,7 @@ npm run dev
 Nota: el CSV solo incluye filas con `CONDICION = INGRESO`, respeta los campos obligatorios activados y excluye alumnos que ya tengan correo en Outlook por `Fax` (DNI) o `Postal code` (codigo de estudiante), correos ya registrados en el CSV de Outlook y duplicados internos.
 Para esta validacion, el registro de Outlook solo bloquea la exportacion si tiene `User principal name`. En esos casos se muestra una tabla con el alumno detectado, el tipo de coincidencia y el correo existente.
 Si el Excel trae `a_paterno` y `a_materno`, el campo `Apellido` se arma con ambos y el correo se genera usando solo `a_paterno` completo. Asi, `De la Cruz` pasa a `delacruz` en el usuario.
+En el editor de mapeo aparecen filas separadas para `Apellido paterno` y `Apellido materno`, de modo que puedes asignarlas manualmente aunque el Excel use otros nombres de columna.
 
 ## Cambiar defaults de mapeo
 
